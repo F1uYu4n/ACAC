@@ -18,8 +18,14 @@ import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import o9.a;
 
@@ -35,6 +41,19 @@ import o9.a;
  *   POST https://www.acfun.cn/rest/pc-direct/channel/resource/query/match
  *        sortField=rankScore&channelId={cid}&page={page}
  * 返回 JSON: { result:0, feed:[...], total:n, channelInfo:{...} }
+ *
+ * 1.0.4 修复要点:
+ *   - 同一分区内请求串行化: App 的滚动监听会在一次快滑里连发十几个页码,
+ *     原来每页各开一个线程, 响应顺序完全错乱, 而列表只按"到达顺序"追加,
+ *     于是页序颠倒; 更糟的是 page==1 走 set() 替换, 若它晚于 page==2 到达,
+ *     已追加的第 2 页会被整个冲掉。改为每 cid 一个单线程队列后, 响应严格
+ *     按请求顺序回到 UI 线程。
+ *   - 在途去重 + 已加载页码短路: 同一 (cid,page) 只发一次; 页码不大于已交付
+ *     的最高页时直接返回空列表, 既不重复追加也不浪费流量。
+ *   - 末页不再报错: 接口对超出范围的页返回 result=21, 原来当成异常抛给 UI,
+ *     整页被替换成"网络错误"。现在按 total 预先算出末页, 越界直接返回空列表;
+ *     万一仍拿到 result=21, 也按"没有更多"处理。
+ *   - 日期统一为 yyyy-MM-dd HH:mm (原来只有 MM-dd, 跨年内容有歧义)。
  */
 public final class Patch {
 
@@ -44,9 +63,23 @@ public final class Patch {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
                     + "Chrome/111.0.0.0 Safari/537.36";
 
+    /** 接口对"页码越界"返回的业务码 */
+    private static final int RESULT_NO_MORE = 21;
+
     private static final int TITLE_ID_BASE = 100000;
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+    /** 保护下面四张表; 请求从 UI 线程发起, 结果在各自的工作线程写回 */
+    private static final Object LOCK = new Object();
+    /** cid -> 单线程队列, 保证同一分区的请求按页码顺序完成 */
+    private static final Map<Integer, ExecutorService> QUEUES = new HashMap<Integer, ExecutorService>();
+    /** cid -> 在途页码, 防止同一页被重复拉取 */
+    private static final Map<Integer, Set<Integer>> PENDING = new HashMap<Integer, Set<Integer>>();
+    /** cid -> 已成功交付的最大页码(page>1), 用于丢弃重复请求 */
+    private static final Map<Integer, Integer> HIGHEST = new HashMap<Integer, Integer>();
+    /** cid -> 末页页码, 来自 page=1 的 total, 越界请求直接短路 */
+    private static final Map<Integer, Integer> LAST_PAGE = new HashMap<Integer, Integer>();
 
     private Patch() {
     }
@@ -60,43 +93,146 @@ public final class Patch {
     public static void categoryDetail(final int id, final int page, final a cb) {
         // 标题行传下来的是 100000+cid, 用于绕开 b9.a.f2207b 的"切换顶部标签"逻辑
         int cid = id >= TITLE_ID_BASE ? id - TITLE_ID_BASE : id;
-        request(cid, page <= 0 ? 1 : page, false, cb);
+        request(cid, page, false, cb);
     }
 
-    private static void request(final int cid, final int page, final boolean withTitle, final a cb) {
-        Log.i(TAG, "category cid=" + cid + " page=" + page + " title=" + withTitle);
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    final List<HomeRecommendItem> data = fetch(cid, page, withTitle);
-                    Log.i(TAG, "cid=" + cid + " page=" + page + " items=" + data.size());
-                    MAIN.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            cb.c(data);
-                        }
-                    });
-                } catch (final Throwable t) {
-                    Log.e(TAG, "cid=" + cid + " page=" + page + " failed: " + t, t);
-                    MAIN.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            cb.d(t);
-                        }
-                    });
+    private static void request(final int cid, final int reqPage, final boolean withTitle, final a cb) {
+        final int page = reqPage <= 0 ? 1 : reqPage;
+        synchronized (LOCK) {
+            if (!withTitle) {
+                Integer last = LAST_PAGE.get(cid);
+                if (last != null && page > last.intValue()) {
+                    Log.i(TAG, "cid=" + cid + " page=" + page + " > last(" + last + "), skip");
+                    postEmpty(cb);
+                    return;
+                }
+                Integer hi = HIGHEST.get(cid);
+                if (hi != null && page <= hi.intValue()) {
+                    Log.i(TAG, "cid=" + cid + " page=" + page + " already loaded(" + hi + "), skip");
+                    postEmpty(cb);
+                    return;
                 }
             }
-        }, "acac-fix-" + cid).start();
+            Set<Integer> pending = PENDING.get(cid);
+            if (pending == null) {
+                pending = new HashSet<Integer>();
+                PENDING.put(cid, pending);
+            }
+            if (!pending.add(Integer.valueOf(page))) {
+                // 同一页已在途: 不再发请求, 由在途的那次回调
+                Log.i(TAG, "cid=" + cid + " page=" + page + " in flight, skip");
+                return;
+            }
+        }
+
+        Log.i(TAG, "enqueue cid=" + cid + " page=" + page + " title=" + withTitle);
+        executor(cid).execute(new Runnable() {
+            @Override
+            public void run() {
+                List<HomeRecommendItem> data = null;
+                Throwable error = null;
+                try {
+                    data = fetch(cid, page, withTitle);
+                } catch (Throwable t) {
+                    error = t;
+                }
+                synchronized (LOCK) {
+                    PENDING.get(cid).remove(Integer.valueOf(page));
+                }
+                if (error != null) {
+                    Log.e(TAG, "cid=" + cid + " page=" + page + " failed: " + error, error);
+                    postError(cb, error);
+                    return;
+                }
+                // data == null 表示"已到末页": 记下末页, 返回空列表而不是抛异常
+                List<HomeRecommendItem> out = data == null ? new ArrayList<HomeRecommendItem>(0) : data;
+                Log.i(TAG, "cid=" + cid + " page=" + page + " items=" + out.size());
+                postData(cb, out);
+            }
+        });
     }
 
+    private static ExecutorService executor(final int cid) {
+        synchronized (LOCK) {
+            ExecutorService es = QUEUES.get(cid);
+            if (es == null) {
+                es = Executors.newSingleThreadExecutor();
+                QUEUES.put(cid, es);
+            }
+            return es;
+        }
+    }
+
+    private static void postData(final a cb, final List<HomeRecommendItem> data) {
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                cb.c(data);
+            }
+        });
+    }
+
+    private static void postEmpty(final a cb) {
+        postData(cb, new ArrayList<HomeRecommendItem>(0));
+    }
+
+    private static void postError(final a cb, final Throwable t) {
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                cb.d(t);
+            }
+        });
+    }
+
+    /**
+     * 请求一页数据。
+     *
+     * @return 卡片列表; 返回 null 表示页码越界(已到末页), 调用方应转成空列表
+     */
     private static List<HomeRecommendItem> fetch(int cid, int page, boolean withTitle) throws Exception {
         String body = "sortField=rankScore&channelId=" + cid + "&page=" + page;
         String json = post(API, body);
         JSONObject root = new JSONObject(json);
         int result = root.optInt("result", -1);
         if (result != 0) {
+            if (page > 1 && result == RESULT_NO_MORE) {
+                // 越界: 记住"上一页"就是末页, 后续对该 cid 的更大页码直接短路
+                synchronized (LOCK) {
+                    Integer last = LAST_PAGE.get(cid);
+                    int bound = page - 1;
+                    if (last == null || bound < last.intValue()) {
+                        LAST_PAGE.put(cid, Integer.valueOf(bound));
+                    }
+                }
+                Log.i(TAG, "cid=" + cid + " page=" + page + " beyond end (result=" + result + ")");
+                return null;
+            }
             throw new IllegalStateException("acfun result=" + result + " msg=" + root.optString("msg"));
+        }
+
+        JSONArray feed = root.optJSONArray("feed");
+        int feedLen = feed == null ? 0 : feed.length();
+
+        // 用 total / 每页条数反推末页, 让越界请求在本地被拦下, 不必真的打到接口
+        if (page == 1 && feedLen > 0) {
+            long total = root.optLong("total", 0L);
+            if (total > 0) {
+                int lastPage = (int) ((total + feedLen - 1) / feedLen);
+                synchronized (LOCK) {
+                    LAST_PAGE.put(cid, Integer.valueOf(lastPage));
+                }
+            }
+        }
+
+        if (feedLen == 0) {
+            // result=0 但没数据, 同样视为到底
+            if (page > 1) {
+                synchronized (LOCK) {
+                    LAST_PAGE.put(cid, Integer.valueOf(page - 1));
+                }
+                return null;
+            }
         }
 
         ArrayList<HomeRecommendItem> out = new ArrayList<HomeRecommendItem>();
@@ -108,23 +244,29 @@ public final class Patch {
             out.add(title);
         }
 
-        JSONArray feed = root.optJSONArray("feed");
-        if (feed != null) {
-            int n = 0;
-            for (int i = 0; i < feed.length(); i++) {
-                JSONObject o = feed.optJSONObject(i);
-                if (o == null) {
-                    continue;
+        int n = 0;
+        for (int i = 0; i < feedLen; i++) {
+            JSONObject o = feed.optJSONObject(i);
+            if (o == null) {
+                continue;
+            }
+            AcContent content = toContent(o);
+            if (content == null) {
+                continue;
+            }
+            HomeRecommendItem item = new HomeRecommendItem();
+            item.setViewType(1);
+            item.setItem(content);
+            item.setInnerItemCount(n++);
+            out.add(item);
+        }
+
+        if (!withTitle && page > 1 && n > 0) {
+            synchronized (LOCK) {
+                Integer hi = HIGHEST.get(cid);
+                if (hi == null || page > hi.intValue()) {
+                    HIGHEST.put(cid, Integer.valueOf(page));
                 }
-                AcContent content = toContent(o);
-                if (content == null) {
-                    continue;
-                }
-                HomeRecommendItem item = new HomeRecommendItem();
-                item.setViewType(1);
-                item.setItem(content);
-                item.setInnerItemCount(n++);
-                out.add(item);
             }
         }
         return out;
@@ -216,7 +358,8 @@ public final class Patch {
         if (ms <= 0) {
             return "";
         }
-        return new SimpleDateFormat("MM-dd", Locale.US).format(new Date(ms));
+        // 卡片里日期与 UP 名同行, 宽度有限: 只到日, 既消除跨年歧义又不会被裁掉
+        return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date(ms));
     }
 
     private static String post(String url, String body) throws Exception {

@@ -93,7 +93,7 @@
    - 组装 App 原有的 `HomeRecommendItem` + `AcContent`：`viewType=2` 是分区块标题行，`viewType=1` 是视频卡；
    - 回调切回主线程 `Handler(Looper.getMainLooper()).post(...)`，与原 Retrofit 回调的线程模型一致；
    - 卡片 `url` 设为 `https://www.acfun.cn/v/ac{dougaId}`，复用原有的点击跳转逻辑；
-   - 时长 / 播放 / 弹幕 / 日期按中文习惯格式化（`mm:ss`、`1.2万`、`1.1亿`、`MM-dd`）。
+   - 时长 / 播放 / 弹幕 / 日期按中文习惯格式化（`mm:ss`、`1.2万`、`1.1亿`、`yyyy-MM-dd`）。
 
 3. 标题行的 `titleId` 传 `100000 + cid`。原逻辑里 `titleId` 会被 `b9.a` 映射成顶部标签索引，点标题会「原地切标签」；加上偏移量后不再命中映射，于是点标题 / 「更多」会正常打开 `CategoryDetailFragment` 的可翻页列表（每页 30 条）。
 
@@ -115,7 +115,36 @@
 
 ![detail](images/detail.jpg)
 
-## 六、复现步骤
+## 六、1.0.4 修复的翻页缺陷
+
+首版 1.0.4 只解决了「没数据」，翻页路径上还有三个真机可复现的问题，同版一并修掉。
+
+### 1. 翻页请求并发 → 页序错乱、丢失整页
+
+App 的滚动监听每滚一格就 `page + 1` 并请求下一页，而 `page == 1` 走 `set()` 替换、`page > 1` 走 `add()` 追加。首版补丁每页各开一个线程，实测一次快滑发出 13 个请求后，响应按 `4,7,5,6,3,9,8,14,10,12,13,11,15` 乱序到达，于是：
+
+- 列表里第 4 页的内容排在第 3 页前面；
+- 首屏 `page=1` 与 `page=2` 间隔 27 ms 发出，若 `page=1` 后到，它的 `set()` 会把已追加的第 2 页整个冲掉，列表凭空少 30 条。
+
+修复：每个 cid 一个**单线程队列**（`Executors.newSingleThreadExecutor()`），响应严格按请求顺序回到 UI 线程。
+
+### 2. 在途去重与页码短路
+
+同一 `(cid, page)` 在途时不再重复发请求；页码不大于已交付的最高页、或超过 `total` 反推的末页时，直接回空列表。
+
+### 3. 翻到末尾整页变「网络错误」
+
+接口对越界页码返回 `result=21`（实测 334 页的分区第 335 页、鱼塘第 76 页之后），首版把它当异常抛给 UI，`BaseFragment.c0()` 会把内容区 `setVisibility(GONE)` 换成错误图标加一行 `acfun result=21 msg=null`。
+
+修复：`page == 1` 时用 `total / 每页条数` 算出末页并缓存；越界请求本地短路回空列表；万一仍拿到 `result=21` 也按「没有更多」处理。App 收到空列表只会 `d0(false)` 收尾，不会报错。
+
+### 4. 日期
+
+`MM-dd` 跨年有歧义，改为 `yyyy-MM-dd`（不带时分，否则会被同行 UP 名挤到截断）。
+
+验证：一次快滑连发 17 个页请求（page 3~19），完成顺序严格为 `3,4,5,…,19`，全部落在同一个工作线程。
+
+## 七、复现步骤
 
 ```bash
 # 1. 准备：原始 v1.0.3 APK、apktool 2.x、Android build-tools、JDK8 + JDK11+
@@ -139,12 +168,16 @@ adb logcat -s ACACFIX:*
 日志样例：
 
 ```
-I/ACACFIX: category cid=201 page=1 title=true
-I/ACACFIX: cid=201 page=1 items=31
+I/ACACFIX: enqueue cid=201 page=1 title=true
+I/ACACFIX: enqueue cid=1 page=3 title=false
+I/ACACFIX: cid=1 page=3 items=30
+I/ACACFIX: cid=125 page=77 > last(76), skip
 ```
 
-## 七、已知限制
+## 八、已知限制
 
-- 分区固定 `sortField=rankScore`（热度），每页 30 条，翻页正常；未做「最新」/ 时长 / 日期筛选 UI（原 App 界面也没有这些控件）。
+- 分区固定 `sortField=rankScore`（热度），每页 30 条，翻页正常；未做「最新」/ 时长 / 日期筛选 UI（原 App 界面也没有这些控件）。实测 `sortField=createTime` 可用（按最新投稿），需要时只改一个字符串。
 - 未改动「推荐」「文章区」等其它入口的行为。
+- 「搜索页 → 热门搜索」永远为空：原 App 里 `HotWordModel` 只出现在适配器绑定分支，工程内没有任何地方往列表填数据（与站点改版无关，是原版遗留），补丁层没有可挂钩的入口。
+- 「UP 主页（用户空间）」仍走 HTML 解析，实测现返回空壳 `<div id="ac-space-video-list"></div>`，大概率也是空的；入口较深，未纳入本次修复。
 - A 站再次改接口时，只需修改 `patch/src/com/acac/fix/Patch.java` 中的 `API` 常量与 `toContent()` 字段映射，重跑 `scripts/build.sh`。
